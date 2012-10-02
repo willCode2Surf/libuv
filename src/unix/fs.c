@@ -245,21 +245,131 @@ static ssize_t uv__fs_readlink(uv_fs_t* req) {
 }
 
 
+__attribute__((unused))
+static ssize_t uv__fs_sendfile_emul(uv_fs_t* req) {
+  int reset_nbio;
+  int use_pread;
+  off_t offset;
+  ssize_t nsent;
+  ssize_t nread;
+  ssize_t nwritten;
+  size_t buflen;
+  size_t len;
+  ssize_t n;
+  int in_fd;
+  int out_fd;
+  char buf[8192];
+
+  len = req->len;
+  in_fd = req->flags;
+  out_fd = req->file;
+  offset = req->off;
+  use_pread = 1;
+  reset_nbio = 0;
+
+  /* Here are the rules regarding errors:
+   *
+   * 1. Read errors are reported only if nsent==0, otherwise we return nsent.
+   *    The user needs to know that some data has already been sent, to stop
+   *    him from sending it twice.
+   *
+   * 2. Write errors are always reported. Write errors are bad because they
+   *    mean data loss: we've read data but we can't write it out...
+   */
+  for (nsent = 0; (size_t) nsent < len; ) {
+    buflen = len - nsent;
+
+    if (buflen > sizeof(buf))
+      buflen = sizeof(buf);
+
+    do {
+      if (use_pread)
+        nread = pread(in_fd, buf, buflen, offset);
+      else
+        nread = read(in_fd, buf, buflen);
+    }
+    while (nread == -1 && errno == EINTR);
+
+    if (nread == 0)
+      goto out;
+
+    if (nread == -1) {
+      if (use_pread && nsent == 0 && (errno == EIO || errno == ESPIPE)) {
+        use_pread = 0;
+        continue;
+      }
+
+      if (nsent == 0)
+        nsent = -1;
+
+      goto out;
+    }
+
+    for (nwritten = 0; nwritten < nread; ) {
+      do
+        n = write(out_fd, buf + nwritten, nread - nwritten);
+      while (n == -1 && errno == EINTR);
+
+      if (n == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          uv__nonblock(out_fd, 0);
+          reset_nbio = 1;
+          continue;
+        }
+
+        nsent = -1;
+        goto out;
+      }
+
+      nwritten += n;
+    }
+
+    offset += nread;
+    nsent += nread;
+  }
+
+out:
+  if (reset_nbio)
+    uv__nonblock(out_fd, 1);
+
+  if (nsent != -1)
+    req->off = offset;
+
+  return nsent;
+}
+
+
 static ssize_t uv__fs_sendfile(uv_fs_t* req) {
-  /* req->file is the out_fd, req->flags the in_fd */
+  int in_fd;
+  int out_fd;
+
+  in_fd = req->flags;
+  out_fd = req->file;
+
+#if defined(__sun)
+  {
+    struct stat s;
+
+    if (fstat(in_fd, &s) == -1)
+      return -1;
+
+    if (!S_ISREG(s.st_mode))
+      return uv__fs_sendfile_emul(req);
+
+    if (fstat(out_fd, &s) == -1)
+      return -1;
+
+    if (!S_ISSOCK(s.st_mode))
+      return uv__fs_sendfile_emul(req);
+  }
+#endif
+
 #if defined(__linux__) || defined(__sun)
-  return sendfile(req->file, req->flags, &req->off, req->len);
+  return sendfile(out_fd, in_fd, &req->off, req->len);
 #elif defined(__APPLE__) || defined(__FreeBSD__)
-  return sendfile(req->flags,
-                  req->file,
-                  req->off,
-                  req->len,
-                  NULL,
-                  &req->off,
-                  0);
+  return sendfile(in_fd, out_fd, req->off, req->len, NULL, &req->off, 0);
 #else
-  errno = ENOSYS;
-  return -1;
+  return uv__fs_sendfile_emul(req);
 #endif
 }
 
